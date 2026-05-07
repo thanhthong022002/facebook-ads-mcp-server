@@ -9,7 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application code
 COPY . ./
 
-# Expose port if needed, though MCP uses stdio
+# Expose port for SSE
+EXPOSE 8000
 
 # Command to run the MCP server. The Facebook token must be provided via --fb-token argument.
 CMD ["python", "server.py", "--fb-token", "dummy_facebook_access_token"]
