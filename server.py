@@ -18,8 +18,8 @@ DEFAULT_AD_ACCOUNT_FIELDS = [
     'created_time', 'id'
 ]
 
-# Create an MCP server
-mcp = FastMCP("fb-api-mcp-server")
+# Create an MCP server bound for Docker port publishing.
+mcp = FastMCP("fb-api-mcp-server", host="0.0.0.0", port=8000)
 
 # Add a global variable to store the token
 FB_ACCESS_TOKEN = None
@@ -2293,5 +2293,7 @@ def get_activities_by_adset(
 
 if __name__ == "__main__":
     _get_fb_access_token()
-    mcp.run(transport='sse', host='0.0.0.0', port=8000)
+    # Keep invocation compatible across MCP SDK versions.
+    # Newer versions may not accept explicit host/port kwargs.
+    mcp.run(transport='sse')
     
