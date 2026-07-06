@@ -112,6 +112,14 @@
     {
       "name": "get_activities_by_adset",
       "description": "Retrieves change history for an ad set"
+    },
+    {
+      "name": "get_comments_by_object_id",
+      "description": "Retrieves comments on a post/photo/video object"
+    },
+    {
+      "name": "get_comments_by_ad_id",
+      "description": "Resolves an ad to its Page post and retrieves that post's comments"
     }
   ],
   "keywords": [

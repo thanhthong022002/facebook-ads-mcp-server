@@ -127,6 +127,9 @@ This MCP server provides tools for interacting with META Ads objects and data:
 | **Activity/Change History**     |                                                          |
 | `get_activities_by_adaccount`   | Retrieves change history for an ad account.              |
 | `get_activities_by_adset`       | Retrieves change history for an ad set.                  |
+| **Comments (Post Engagement)**  |                                                          |
+| `get_comments_by_object_id`     | Retrieves comments on a post/photo/video object.         |
+| `get_comments_by_ad_id`         | Resolves an ad to its post, then retrieves its comments. |
 
 *(Note: Most tools support additional parameters like `fields`, `filtering`, `limit`, pagination, date ranges, etc. Refer to the detailed docstrings within `server.py` for the full list and description of arguments for each tool.)*
 
