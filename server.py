@@ -2291,6 +2291,170 @@ def get_activities_by_adset(
     return _make_graph_api_call(url, params)
 
 
+@mcp.tool()
+def get_comments_by_object_id(
+    object_id: str,
+    fields: Optional[List[str]] = None,
+    filter: Optional[str] = None,
+    order: Optional[str] = None,
+    limit: Optional[int] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None
+) -> Dict:
+    """Retrieves comments on a Facebook object (a Page post, photo, or video).
+
+    Comments live on the underlying Page post/media, not on the ad object itself.
+    Use this when you already have the object id — e.g. a post id (usually in the
+    form '{page_id}_{post_id}'), a photo id, or a video id. To start from an ad,
+    use `get_comments_by_ad_id`, which resolves the ad's post for you.
+
+    Note: reading comments requires a token with Page engagement permission
+    (e.g. 'pages_read_engagement'), and the token's user must have a role on the
+    Page. An 'ads_read'-only token will typically return an empty list or an error.
+
+    Args:
+        object_id (str): The ID of the object whose comments to fetch — a post id
+            (usually '{page_id}_{post_id}'), a photo id, or a video id.
+        fields (Optional[List[str]]): Comment fields to retrieve. If None, the Graph
+            API returns its defaults (id, created_time, message). Available fields
+            include:
+            - 'id': The comment's ID
+            - 'message': The text of the comment
+            - 'created_time': When the comment was created
+            - 'from': The commenter (id and name; may be limited by privacy/permissions)
+            - 'like_count': Number of likes on the comment
+            - 'comment_count': Number of replies to the comment
+            - 'parent': The parent comment (present on replies)
+            - 'permalink_url': A direct URL to the comment
+            - 'attachment': Any media attached to the comment
+            - 'message_tags': Profiles/pages tagged in the comment
+            - 'user_likes': Whether the current user liked the comment
+        filter (Optional[str]): Which comments to include:
+            - 'toplevel': only top-level comments (default behaviour)
+            - 'stream': all comments including replies, as a flat stream
+        order (Optional[str]): Sort order — 'chronological' or
+            'reverse_chronological' (the API default).
+        limit (Optional[int]): Maximum number of comments to return per page.
+        after (Optional[str]): Pagination cursor for the next page
+            (from 'paging.cursors.after' in a previous response).
+        before (Optional[str]): Pagination cursor for the previous page
+            (from 'paging.cursors.before' in a previous response).
+
+    Returns:
+        Dict: The comments edge. Results are in the 'data' list and pagination info
+              is in the 'paging' object; pass 'paging.next' to `fetch_pagination_url`
+              to page through long threads.
+
+    Example:
+        ```python
+        # Top-level comments on a post, newest first, with commenter and like count
+        comments = get_comments_by_object_id(
+            object_id="1234567890_9876543210",
+            fields=["message", "created_time", "from", "like_count", "comment_count"],
+            order="reverse_chronological",
+            limit=50
+        )
+
+        # All comments including replies
+        all_comments = get_comments_by_object_id(
+            object_id="1234567890_9876543210",
+            filter="stream"
+        )
+        ```
+    """
+    return _fetch_edge(
+        object_id,
+        'comments',
+        fields=fields,
+        filter=filter,
+        order=order,
+        limit=limit,
+        after=after,
+        before=before
+    )
+
+
+@mcp.tool()
+def get_comments_by_ad_id(
+    ad_id: str,
+    fields: Optional[List[str]] = None,
+    filter: Optional[str] = None,
+    order: Optional[str] = None,
+    limit: Optional[int] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None
+) -> Dict:
+    """Retrieves the comments on the Page post behind a Facebook ad.
+
+    Convenience wrapper that makes two Graph API calls:
+      1. Resolve the ad's creative to its post id
+         (creative.effective_object_story_id, falling back to object_story_id).
+      2. Fetch that post's 'comments' edge (same as `get_comments_by_object_id`).
+
+    Comments belong to the underlying Page post, so ads that don't map to a Page
+    post (e.g. some dynamic/catalog or story-only formats) have no story id — in
+    that case a dict with an 'error' message and the 'ad_id' is returned instead.
+
+    Note: reading comments requires a token with Page engagement permission
+    (e.g. 'pages_read_engagement'); an 'ads_read'-only token will usually return an
+    empty list or an error.
+
+    Args:
+        ad_id (str): The ID of the ad whose post comments to fetch.
+        fields (Optional[List[str]]): Comment fields to retrieve — see
+            `get_comments_by_object_id` for the full list (e.g. 'message',
+            'created_time', 'from', 'like_count', 'comment_count', 'parent').
+        filter (Optional[str]): 'toplevel' (top-level only) or 'stream' (include replies).
+        order (Optional[str]): 'chronological' or 'reverse_chronological'.
+        limit (Optional[int]): Maximum number of comments to return per page.
+        after (Optional[str]): Pagination cursor for the next page.
+        before (Optional[str]): Pagination cursor for the previous page.
+
+    Returns:
+        Dict: The comments edge for the ad's post (a 'data' list plus 'paging'),
+              annotated with the resolved 'post_id'. If the ad has no associated
+              post, a dict with an 'error' message and the 'ad_id' is returned instead.
+
+    Example:
+        ```python
+        comments = get_comments_by_ad_id(
+            ad_id="23843211234567",
+            fields=["message", "created_time", "from", "like_count"],
+            order="reverse_chronological",
+            limit=50
+        )
+        ```
+    """
+    # Step 1: resolve the ad's post (object story) id from its creative.
+    ad = _fetch_node(ad_id, fields='creative{effective_object_story_id,object_story_id}')
+    creative = ad.get('creative', {}) if isinstance(ad, dict) else {}
+    post_id = creative.get('effective_object_story_id') or creative.get('object_story_id')
+
+    if not post_id:
+        return {
+            'error': 'No associated Page post found for this ad, so it has no comments '
+                     'edge (its creative has neither effective_object_story_id nor '
+                     'object_story_id).',
+            'ad_id': ad_id,
+            'creative': creative or None
+        }
+
+    # Step 2: fetch the comments on that post.
+    result = _fetch_edge(
+        post_id,
+        'comments',
+        fields=fields,
+        filter=filter,
+        order=order,
+        limit=limit,
+        after=after,
+        before=before
+    )
+    if isinstance(result, dict):
+        result['post_id'] = post_id
+    return result
+
+
 if __name__ == "__main__":
     _get_fb_access_token()
     # Keep invocation compatible across MCP SDK versions.
