@@ -128,10 +128,23 @@ This MCP server provides tools for interacting with META Ads objects and data:
 | `get_activities_by_adaccount`   | Retrieves change history for an ad account.              |
 | `get_activities_by_adset`       | Retrieves change history for an ad set.                  |
 | **Comments (Post Engagement)**  |                                                          |
-| `get_comments_by_object_id`     | Retrieves comments on a post/photo/video object.         |
-| `get_comments_by_ad_id`         | Resolves an ad to its post, then retrieves its comments. |
+| `get_comments_by_object_id`     | Retrieves comments on a post/photo/video object (auto-mints the Page token). |
+| `get_comments_by_ad_id`         | Resolves an ad to BOTH its Facebook post and Instagram media, then retrieves comments from each placement. |
+| `get_instagram_media_comments`  | Retrieves comments on an Instagram media object (e.g. an ad's IG placement). |
+| `list_pages`                    | Lists the Pages the user manages (id + name), for diagnosing comment-permission failures. Never returns Page tokens. |
 
 *(Note: Most tools support additional parameters like `fields`, `filtering`, `limit`, pagination, date ranges, etc. Refer to the detailed docstrings within `server.py` for the full list and description of arguments for each tool.)*
+
+#### Reading comments — how it works and what to expect
+
+Reading a Facebook Page post's comments requires the **owning Page's access token**, not the raw user token — and that only works when the token's user has a **role on that Page**. These tools handle this automatically:
+
+- **Automatic Page-token minting.** `get_comments_by_object_id` and `get_comments_by_ad_id` derive the Page id from the post id (`{page_id}_{post_id}`), mint that Page's access token from the user token, and use it. Page tokens are cached in-memory and never exposed through any tool.
+- **Instagram coverage.** An ad's engagement can live on its Facebook post *and/or* its Instagram media. `get_comments_by_ad_id` now resolves `effective_instagram_media_id` too and returns a dedicated `instagram` section, so IG-only / cross-placement ads no longer come back empty.
+- **Full error detail.** Graph API error responses are returned as a structured `{"error": {...}}` body (message, `code`, `error_subcode`, `http_status`) instead of an opaque HTTP failure. Common cases: `code 10` (app lacks `pages_read_engagement` / Page Public Content Access) and `code 100` / `error_subcode 33` (the user has no role on that Page — use `list_pages` to check).
+- **Dark posts.** Unpublished, ad-only "dark" posts report a nonzero comment `total_count` while the individual comments are **not** retrievable via the Graph API. In that case `get_comments_by_ad_id` returns the `total_count` plus an explanatory `note`, so you can distinguish "no comments" from "comments exist but are only visible in Ads Manager."
+
+**Required permissions:** a token with `pages_read_engagement` and `pages_read_user_content`, whose user has a role on each Page whose ads you want to read comments for.
 
 *(Note: If your Meta access token expires, you'll need to generate a new one and update the configuration file of the MCP Client with new token to continue using the tools.)*
 

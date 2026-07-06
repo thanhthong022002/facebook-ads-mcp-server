@@ -53,17 +53,39 @@ def _get_fb_access_token() -> str:
     return FB_ACCESS_TOKEN
 
 def _make_graph_api_call(url: str, params: Dict[str, Any]) -> Dict:
-    """Makes a GET request to the Facebook Graph API and handles the response."""
+    """Makes a GET request to the Facebook Graph API and returns the parsed body.
+
+    On error responses (4xx/5xx), the Graph API returns a JSON body describing the
+    failure — e.g. {'error': {'message': ..., 'code': 100, 'error_subcode': 33}}.
+    A bare raise_for_status() throws that detail away, leaving callers with only an
+    opaque HTTP status. Instead, we return the parsed error body so the caller (and
+    the LLM) can see *why* the call failed (missing permission, no Page role, bad
+    field, etc.) and act on it.
+    """
     try:
         response = requests.get(url, params=params)
-        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-        return response.json()
     except requests.exceptions.RequestException as e:
-        # Log the error and re-raise or handle more gracefully
-        print(f"Error making Graph API call to {url} with params {params}: {e}")
-        # Depending on desired behavior, you might want to raise a custom exception
-        # or return a specific error structure. Re-raising keeps the current behavior.
-        raise
+        # Network-level failure (DNS, connection, timeout) — no HTTP body to return.
+        print(f"Network error calling Graph API at {url}: {e}")
+        return {'error': {'message': str(e), 'type': 'NetworkError', 'is_transport_error': True}}
+
+    # Try to parse the body regardless of status — Graph API errors are JSON too.
+    try:
+        body = response.json()
+    except ValueError:
+        body = {'error': {'message': response.text or 'Non-JSON response from Graph API',
+                          'type': 'InvalidResponse', 'http_status': response.status_code}}
+
+    if not response.ok:
+        # Ensure the caller always sees a consistent 'error' envelope with the
+        # Graph API's own message/code/subcode when available.
+        if isinstance(body, dict) and 'error' in body:
+            body['error'].setdefault('http_status', response.status_code)
+            print(f"Graph API error ({response.status_code}) at {url}: {body['error']}")
+            return body
+        return {'error': {'message': str(body), 'http_status': response.status_code}}
+
+    return body
 
 
 def _prepare_params(base_params: Dict[str, Any], **kwargs) -> Dict[str, Any]:
@@ -117,6 +139,82 @@ def _fetch_edge(parent_id: str, edge_name: str, **kwargs) -> Dict:
     params = _prepare_params(base_params, **kwargs)
     params.update(_prepare_params({}, **time_params)) # Add specific time params
 
+    return _make_graph_api_call(url, params)
+
+
+# Cache of page_id -> page access token, so we mint each page token only once.
+_PAGE_TOKEN_CACHE: Dict[str, Optional[str]] = {}
+
+
+def _get_page_access_token(page_id: str) -> Optional[str]:
+    """Mint (and cache) a Page access token for a given Page id.
+
+    A user token can only read a Page post's engagement (comments, etc.) if it is
+    exchanged for that Page's own access token — and that only works when the token's
+    user has a role on the Page. Returns the page token on success, or None if the
+    user has no access to that Page (in which case the caller should fall back to the
+    user token and let the Graph API report the real permission error).
+    """
+    if page_id in _PAGE_TOKEN_CACHE:
+        return _PAGE_TOKEN_CACHE[page_id]
+
+    user_token = _get_fb_access_token()
+    url = f"{FB_GRAPH_URL}/{page_id}"
+    resp = _make_graph_api_call(url, {'access_token': user_token, 'fields': 'access_token'})
+    token = resp.get('access_token') if isinstance(resp, dict) else None
+    _PAGE_TOKEN_CACHE[page_id] = token
+    if token is None:
+        # Not fatal — surface why for debugging, but let the caller decide.
+        print(f"Could not mint a Page token for page {page_id}: {resp.get('error') if isinstance(resp, dict) else resp}")
+    return token
+
+
+def _page_id_of_object(object_id: str) -> Optional[str]:
+    """Best-effort extraction of the owning Page id from a Graph object id.
+
+    Post ids on the comments edge are usually '{page_id}_{post_id}'. When the id has
+    no underscore (e.g. a bare photo/video/media id), we can't derive the Page and
+    return None.
+    """
+    if isinstance(object_id, str) and '_' in object_id:
+        return object_id.split('_', 1)[0]
+    return None
+
+
+def _fetch_comments(
+    object_id: str,
+    fields: Optional[List[str]] = None,
+    filter: Optional[str] = None,
+    order: Optional[str] = None,
+    limit: Optional[int] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    use_page_token: bool = True,
+) -> Dict:
+    """Fetch the 'comments' edge of an object, preferring a Page token when possible.
+
+    Reading a Page post's comments generally requires the owning Page's access token,
+    not the raw user token. When use_page_token is True and the Page id can be derived
+    from the object id, we mint the Page token and use it; otherwise we fall back to
+    the user token so the Graph API can report the real error.
+    """
+    page_token = None
+    if use_page_token:
+        page_id = _page_id_of_object(object_id)
+        if page_id:
+            page_token = _get_page_access_token(page_id)
+
+    url = f"{FB_GRAPH_URL}/{object_id}/comments"
+    base_token = page_token or _get_fb_access_token()
+    params = _prepare_params(
+        {'access_token': base_token},
+        fields=fields,
+        filter=filter,
+        order=order,
+        limit=limit,
+        after=after,
+        before=before,
+    )
     return _make_graph_api_call(url, params)
 
 
@@ -2299,7 +2397,8 @@ def get_comments_by_object_id(
     order: Optional[str] = None,
     limit: Optional[int] = None,
     after: Optional[str] = None,
-    before: Optional[str] = None
+    before: Optional[str] = None,
+    use_page_token: bool = True
 ) -> Dict:
     """Retrieves comments on a Facebook object (a Page post, photo, or video).
 
@@ -2308,9 +2407,12 @@ def get_comments_by_object_id(
     form '{page_id}_{post_id}'), a photo id, or a video id. To start from an ad,
     use `get_comments_by_ad_id`, which resolves the ad's post for you.
 
-    Note: reading comments requires a token with Page engagement permission
-    (e.g. 'pages_read_engagement'), and the token's user must have a role on the
-    Page. An 'ads_read'-only token will typically return an empty list or an error.
+    Note: reading a Page post's comments requires the owning Page's access token, and
+    the token's user must have a role on that Page. By default this tool automatically
+    mints the Page token from the user token (derived from the '{page_id}_...' prefix
+    of the object id). If the user has no role on the Page, the Graph API returns an
+    error with 'code': 100 / 'error_subcode': 33 — meaning the account can't access
+    that Page, not that the tool is broken.
 
     Args:
         object_id (str): The ID of the object whose comments to fetch — a post id
@@ -2362,15 +2464,15 @@ def get_comments_by_object_id(
         )
         ```
     """
-    return _fetch_edge(
+    return _fetch_comments(
         object_id,
-        'comments',
         fields=fields,
         filter=filter,
         order=order,
         limit=limit,
         after=after,
-        before=before
+        before=before,
+        use_page_token=use_page_token
     )
 
 
@@ -2384,36 +2486,45 @@ def get_comments_by_ad_id(
     after: Optional[str] = None,
     before: Optional[str] = None
 ) -> Dict:
-    """Retrieves the comments on the Page post behind a Facebook ad.
+    """Retrieves the comments behind a Facebook ad, across BOTH placements.
 
-    Convenience wrapper that makes two Graph API calls:
-      1. Resolve the ad's creative to its post id
-         (creative.effective_object_story_id, falling back to object_story_id).
-      2. Fetch that post's 'comments' edge (same as `get_comments_by_object_id`).
+    An ad's engagement can live in two different places:
+      1. The Facebook Page post (creative.effective_object_story_id / object_story_id).
+      2. The Instagram media (creative.effective_instagram_media_id), when the ad also
+         (or only) runs on Instagram.
 
-    Comments belong to the underlying Page post, so ads that don't map to a Page
-    post (e.g. some dynamic/catalog or story-only formats) have no story id — in
-    that case a dict with an 'error' message and the 'ad_id' is returned instead.
+    This tool resolves the creative, then fetches comments from whichever placements
+    exist, so Instagram-only or cross-placement ads no longer come back empty. Because
+    Page-post comments require the owning Page's access token, it automatically mints
+    that Page token from the user token (see get_comments_by_page_post).
 
-    Note: reading comments requires a token with Page engagement permission
-    (e.g. 'pages_read_engagement'); an 'ads_read'-only token will usually return an
-    empty list or an error.
+    Permissions: the token's user must have a role on the owning Page (for FB comments)
+    and the linked Instagram account must be reachable (for IG comments). If not, the
+    Graph API returns an error with 'code': 100 / 'error_subcode': 33 — surfaced in the
+    corresponding section below rather than swallowed.
+
+    Dark posts: unpublished ad-only posts report a nonzero comment 'total_count' in the
+    summary while the individual comments are not retrievable via the API. When that
+    happens this tool still returns, with 'total_count' set and an explanatory 'note',
+    so you can tell "no comments" apart from "comments exist but aren't API-readable".
 
     Args:
-        ad_id (str): The ID of the ad whose post comments to fetch.
-        fields (Optional[List[str]]): Comment fields to retrieve — see
+        ad_id (str): The ID of the ad whose comments to fetch.
+        fields (Optional[List[str]]): FB comment fields to retrieve — see
             `get_comments_by_object_id` for the full list (e.g. 'message',
             'created_time', 'from', 'like_count', 'comment_count', 'parent').
         filter (Optional[str]): 'toplevel' (top-level only) or 'stream' (include replies).
         order (Optional[str]): 'chronological' or 'reverse_chronological'.
         limit (Optional[int]): Maximum number of comments to return per page.
-        after (Optional[str]): Pagination cursor for the next page.
-        before (Optional[str]): Pagination cursor for the previous page.
+        after (Optional[str]): Pagination cursor for the next page (FB comments only).
+        before (Optional[str]): Pagination cursor for the previous page (FB comments only).
 
     Returns:
-        Dict: The comments edge for the ad's post (a 'data' list plus 'paging'),
-              annotated with the resolved 'post_id'. If the ad has no associated
-              post, a dict with an 'error' message and the 'ad_id' is returned instead.
+        Dict: A summary object with:
+              - 'ad_id'
+              - 'facebook': {'post_id', 'total_count', 'comments'|'error', ...} or None
+              - 'instagram': {'media_id', 'comments_count', 'comments'|'error'} or None
+              - 'note': present when comments exist but couldn't be fully retrieved.
 
     Example:
         ```python
@@ -2423,36 +2534,185 @@ def get_comments_by_ad_id(
             order="reverse_chronological",
             limit=50
         )
+        fb = comments.get("facebook") or {}
+        ig = comments.get("instagram") or {}
         ```
     """
-    # Step 1: resolve the ad's post (object story) id from its creative.
-    ad = _fetch_node(ad_id, fields='creative{effective_object_story_id,object_story_id}')
+    # Step 1: resolve the ad's placements (FB post id and IG media id) from its creative.
+    ad = _fetch_node(
+        ad_id,
+        fields='creative{effective_object_story_id,object_story_id,effective_instagram_media_id}'
+    )
+    if isinstance(ad, dict) and 'error' in ad:
+        return {'ad_id': ad_id, 'error': ad['error']}
+
     creative = ad.get('creative', {}) if isinstance(ad, dict) else {}
     post_id = creative.get('effective_object_story_id') or creative.get('object_story_id')
+    ig_media_id = creative.get('effective_instagram_media_id')
 
-    if not post_id:
+    if not post_id and not ig_media_id:
         return {
-            'error': 'No associated Page post found for this ad, so it has no comments '
-                     'edge (its creative has neither effective_object_story_id nor '
-                     'object_story_id).',
+            'error': 'No associated Page post or Instagram media found for this ad, so it '
+                     'has no comments edge (its creative has none of '
+                     'effective_object_story_id, object_story_id, '
+                     'effective_instagram_media_id).',
             'ad_id': ad_id,
             'creative': creative or None
         }
 
-    # Step 2: fetch the comments on that post.
-    result = _fetch_edge(
-        post_id,
-        'comments',
-        fields=fields,
-        filter=filter,
-        order=order,
-        limit=limit,
-        after=after,
-        before=before
-    )
-    if isinstance(result, dict):
-        result['post_id'] = post_id
+    result: Dict[str, Any] = {'ad_id': ad_id, 'facebook': None, 'instagram': None}
+
+    # Step 2a: Facebook Page post comments (with summary so dark posts are diagnosable).
+    if post_id:
+        summary_fields = fields[:] if fields else ['message', 'created_time', 'from', 'like_count']
+        fb = _fetch_comments(
+            post_id,
+            fields=summary_fields,
+            filter=filter or 'stream',
+            order=order,
+            limit=limit,
+            after=after,
+            before=before,
+        )
+        fb_section: Dict[str, Any] = {'post_id': post_id}
+        if isinstance(fb, dict) and 'error' in fb:
+            fb_section['error'] = fb['error']
+        else:
+            data = fb.get('data', []) if isinstance(fb, dict) else []
+            fb_section['comments'] = data
+            if isinstance(fb, dict) and 'paging' in fb:
+                fb_section['paging'] = fb['paging']
+            # Pull the authoritative comment count to detect dark-post hidden comments.
+            total = _fetch_comment_total_count(post_id)
+            if total is not None:
+                fb_section['total_count'] = total
+                if total > 0 and not data:
+                    fb_section['note'] = (
+                        'The post reports comments but none are retrievable via the API. '
+                        'This is typical of unpublished "dark" ad posts — the comments are '
+                        'only visible in Ads Manager, not through the Graph API comments edge.'
+                    )
+        result['facebook'] = fb_section
+
+    # Step 2b: Instagram media comments (uses the Page token that owns the IG account).
+    if ig_media_id:
+        result['instagram'] = _fetch_instagram_comments(ig_media_id, page_id_hint=post_id)
+
     return result
+
+
+def _fetch_comment_total_count(object_id: str) -> Optional[int]:
+    """Return the authoritative comment count for an object, or None if unavailable.
+
+    Uses comments.summary(true).limit(0) so we get the total without pulling data.
+    This is how we detect hidden/dark-post comments (total_count > 0 but data empty).
+    """
+    page_id = _page_id_of_object(object_id)
+    token = _get_page_access_token(page_id) if page_id else None
+    token = token or _get_fb_access_token()
+    resp = _make_graph_api_call(
+        f"{FB_GRAPH_URL}/{object_id}",
+        {'access_token': token, 'fields': 'comments.summary(true).limit(0)'}
+    )
+    if isinstance(resp, dict) and 'error' not in resp:
+        return resp.get('comments', {}).get('summary', {}).get('total_count')
+    return None
+
+
+def _fetch_instagram_comments(media_id: str, page_id_hint: Optional[str] = None) -> Dict:
+    """Fetch comments on an Instagram media object linked to an ad creative.
+
+    IG media comments are read through the owning Page's access token (the Page that
+    the IG business account is connected to). We reuse the FB post's page id as a hint
+    for which Page token to mint; if unavailable we fall back to the user token.
+    """
+    token = None
+    page_id = _page_id_of_object(page_id_hint) if page_id_hint else None
+    if page_id:
+        token = _get_page_access_token(page_id)
+    token = token or _get_fb_access_token()
+
+    resp = _make_graph_api_call(
+        f"{FB_GRAPH_URL}/{media_id}",
+        {'access_token': token,
+         'fields': 'comments_count,like_count,comments{text,username,timestamp,like_count}'}
+    )
+    section: Dict[str, Any] = {'media_id': media_id}
+    if isinstance(resp, dict) and 'error' in resp:
+        section['error'] = resp['error']
+        return section
+    section['comments_count'] = resp.get('comments_count')
+    section['comments'] = resp.get('comments', {}).get('data', []) if isinstance(resp, dict) else []
+    return section
+
+
+@mcp.tool()
+def get_instagram_media_comments(
+    media_id: str,
+    page_id: Optional[str] = None
+) -> Dict:
+    """Retrieves comments on an Instagram media object (e.g. an ad's IG placement).
+
+    Use this when you have an Instagram media id — for ads, this is the creative's
+    'effective_instagram_media_id' (which `get_comments_by_ad_id` resolves for you).
+    The Facebook Page-post comments edge does NOT include Instagram comments, so this
+    is the only path to them.
+
+    Permissions: IG comments are read through the access token of the Facebook Page the
+    Instagram business account is linked to. Pass 'page_id' when you know the owning
+    Page so the correct Page token is minted; otherwise the user token is used, which
+    may fail if it lacks access.
+
+    Args:
+        media_id (str): The Instagram media id (e.g. creative.effective_instagram_media_id).
+        page_id (Optional[str]): The linked Facebook Page id, used to mint the right
+            Page access token. Optional but recommended.
+
+    Returns:
+        Dict: {'media_id', 'comments_count', 'comments': [...]} on success, or
+              {'media_id', 'error': {...}} if the media can't be read.
+
+    Example:
+        ```python
+        ig = get_instagram_media_comments(media_id="18111042998484601", page_id="113897213765")
+        ```
+    """
+    # _fetch_instagram_comments derives the page from a '{page}_{post}' hint, so
+    # synthesize one that carries the bare page_id through when supplied.
+    page_hint = f"{page_id}_" if page_id else None
+    return _fetch_instagram_comments(media_id, page_id_hint=page_hint)
+
+
+@mcp.tool()
+def list_pages(fields: Optional[List[str]] = None) -> Dict:
+    """Lists the Facebook Pages the authenticated user manages (id and name).
+
+    Useful for diagnosing comment-permission failures: reading a Page post's comments
+    requires the user to have a role on that Page. If an ad's owning Page is NOT in this
+    list, comment calls for it will fail with 'code': 100 / 'error_subcode': 33, and the
+    user must be granted a role on that Page (in Business Manager) before comments can
+    be read.
+
+    For safety this returns only 'id' and 'name' by default and never returns the Pages'
+    access tokens.
+
+    Args:
+        fields (Optional[List[str]]): Page fields to retrieve. Defaults to ['id', 'name'].
+            The 'access_token' field is stripped if requested — Page tokens are minted
+            internally and never exposed through this tool.
+
+    Returns:
+        Dict: The 'accounts' edge of the current user — a 'data' list of Pages plus
+              'paging'. Use `fetch_pagination_url` with 'paging.next' to page through.
+    """
+    safe_fields = [f for f in (fields or ['id', 'name']) if f != 'access_token']
+    if not safe_fields:
+        safe_fields = ['id', 'name']
+    access_token = _get_fb_access_token()
+    return _make_graph_api_call(
+        f"{FB_GRAPH_URL}/me/accounts",
+        {'access_token': access_token, 'fields': ','.join(safe_fields), 'limit': 200}
+    )
 
 
 if __name__ == "__main__":
