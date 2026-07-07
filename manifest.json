@@ -119,7 +119,15 @@
     },
     {
       "name": "get_comments_by_ad_id",
-      "description": "Resolves an ad to its Page post and retrieves that post's comments"
+      "description": "Resolves an ad to its Facebook post and Instagram media and retrieves comments from each placement"
+    },
+    {
+      "name": "get_instagram_media_comments",
+      "description": "Retrieves comments on an Instagram media object (e.g. an ad's IG placement)"
+    },
+    {
+      "name": "list_pages",
+      "description": "Lists the Pages the user manages (id and name); never returns Page tokens"
     }
   ],
   "keywords": [
